@@ -58,7 +58,7 @@ def parse_nodes(text: str, allowed_hosts: list[str]) -> tuple[list[DirectNode], 
             if not line or line.startswith("#"):
                 continue
             parts = [part.strip() for part in line.split(",")]
-            if parts[0].lower() in ("ip", "address"):
+            if parts[0].lower() in ("ip", "address", "host"):
                 continue
             rows.append(parts)
     if len(rows) > _MAX_ENTRIES:
@@ -69,14 +69,28 @@ def parse_nodes(text: str, allowed_hosts: list[str]) -> tuple[list[DirectNode], 
     for row in rows:
         try:
             if isinstance(row, dict):
-                ip, port, sni = row["ip"], row.get("port", 443), row["sni"]
+                ip, port = row["ip"], row.get("port", 443)
+                sni = row.get("sni", row.get("host"))
+                if row.get("host") and row.get("sni") and str(row["host"]).lower() != str(row["sni"]).lower():
+                    raise ValueError("Host and SNI must match")
                 latency = row.get("latency_ms", row.get("latency", row.get("rtt_ms")))
                 size = row.get("response_bytes", row.get("bytes", 0))
             else:
                 if not isinstance(row, list) or len(row) < 4:
                     raise ValueError("bad row")
-                ip, port, sni, latency = row[:4]
-                size = row[4] if len(row) > 4 else 0
+                try:
+                    ipaddress.ip_address(row[0])
+                    first_is_ip = True
+                except ValueError:
+                    first_is_ip = False
+                if not first_is_ip and len(row) >= 6:
+                    # Legacy private-pool format: host,sni,ip,port,latency,size.
+                    host, sni, ip, port, latency, size = row[:6]
+                    if _valid_host(host) != _valid_host(sni):
+                        raise ValueError("Host and SNI must match")
+                else:
+                    ip, port, sni, latency = row[:4]
+                    size = row[4] if len(row) > 4 else 0
             address = ipaddress.ip_address(str(ip).strip())
             if address.version != 4 or not address.is_global:
                 raise ValueError("non-public IPv4")
