@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from public_sources import PublicSourceManager
 from direct_nodes import DirectNodeStore
+from direct_route import DirectRouteManager
 
 VERSION = "1.0.0"
 CHUNK = 65536
@@ -91,7 +92,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "persist_credentials": False,
     },
     "public_sources": [],  # optional public HTTPS feeds; disabled unless configured
-    "direct_nodes": {"path": "direct_nodes.local.txt", "allowed_hosts": ["kyfw.12306.cn"], "max_age_hours": 72},
+    "direct_nodes": {"path": "direct_nodes.local.txt", "allowed_hosts": ["kyfw.12306.cn"],
+                     "max_age_hours": 72, "route_enabled": False,
+                     "route_retry": 2, "route_timeout": 6, "max_fail": 3, "cooldown_s": 120},
     "sources": [],   # [{"type":"file","path":"proxies.txt","interval":0},
                      #  {"type":"url","url":"http://...","interval":600}]
     "log_level": "info",
@@ -1051,7 +1054,8 @@ class Checker:
 # ───────────────────────────── 本地网关（正向代理） ─────────────────────────────
 
 class Gateway:
-    def __init__(self, cfg: dict, pool: ProxyPool, checker: Checker) -> None:
+    def __init__(self, cfg: dict, pool: ProxyPool, checker: Checker,
+                 direct_route: Optional[DirectRouteManager] = None) -> None:
         g = cfg["gateway"]
         self.host = g["host"]
         self.port = int(g["port"])
@@ -1063,7 +1067,9 @@ class Gateway:
         self.idle_timeout = float(g["idle_timeout"])
         self.pool = pool
         self.checker = checker
-        self.stats = {"conn": 0, "ok": 0, "fail": 0, "retry": 0, "direct": 0}
+        self.direct_route = direct_route
+        self.stats = {"conn": 0, "ok": 0, "fail": 0, "retry": 0, "direct": 0,
+                      "direct_route_hit": 0, "direct_route_fail": 0}
 
     def _auth_ok(self, headers: list[tuple[str, str]]) -> bool:
         if not self.auth:
@@ -1140,6 +1146,33 @@ class Gateway:
         except ValueError:
             await self._err(writer, 400, "Bad CONNECT target")
             return
+
+        # Opt-in CDN/origin direct routing: these IPs are never proxies.
+        # CONNECT must be raw TCP; the client negotiates/verifies its own TLS.
+        router = self.direct_route
+        if router is not None and router.matches(host, port):
+            tried_direct: set[tuple[str, int, str]] = set()
+            for _ in range(router.max_retry + 1):
+                node = router.pick(host, tried_direct)
+                if node is None:
+                    break
+                tried_direct.add(router.key(node))
+                start = time.monotonic()
+                try:
+                    ur, uw = await router.connect(node)
+                except (OSError, asyncio.TimeoutError, ssl.SSLError) as exc:
+                    router.record(node, False, error=type(exc).__name__)
+                    self.stats["direct_route_fail"] += 1
+                    continue
+                router.record(node, True, (time.monotonic() - start) * 1000)
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+                self.stats["direct_route_hit"] += 1
+                self.stats["ok"] += 1
+                await asyncio.gather(
+                    _pipe(reader, uw), _pipe(ur, writer), return_exceptions=True)
+                return
+            router.counters["fallback"] += 1
 
         attempts = self.max_retry + 1
         last_err = "no proxy available"
@@ -1531,15 +1564,18 @@ class ApiServer:
             return json_response(pool.stats())
 
         # TLS endpoints are not proxies: never mix into /get, /all, checker or gateway.
-        if path == "/direct/stats" and method == "GET":
-            return json_response(self.app.direct_nodes.stats())
+        if path in ("/direct", "/direct/stats") and method == "GET":
+            return json_response({**self.app.direct_nodes.stats(),
+                                  **self.app.direct_route.stats()})
 
-        if path == "/direct/all" and method == "GET":
+        if path in ("/direct/all", "/direct/nodes") and method == "GET":
             host = query.get("host", [None])[0]
-            nodes = self.app.direct_nodes.all(host)
-            return json_response({"count": len(nodes), "nodes": nodes,
+            rows = [self.app.direct_route.annotate(node)
+                    for node in self.app.direct_nodes.nodes
+                    if host is None or node.sni == host.lower()]
+            return json_response({"count": len(rows), "nodes": rows,
                                   "fresh": self.app.direct_nodes.is_fresh(),
-                                  "live_verified": False})
+                                  "https_verified": self.app.direct_route.stats()["https_verified"]})
 
         if path == "/direct/get" and method == "GET":
             host = query.get("host", [""])[0]
@@ -1551,7 +1587,27 @@ class ApiServer:
             return json_response(node)
 
         if path == "/direct/reload" and method == "POST":
-            return json_response(self.app.direct_nodes.reload())
+            result = self.app.direct_nodes.reload()
+            self.app.direct_route.prune()
+            return json_response({**result, **self.app.direct_route.stats()})
+
+        if path == "/direct/route" and method == "POST":
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                return json_response({"error": "enabled_must_be_boolean"}, 400)
+            self.app.direct_route.enabled = enabled
+            return json_response(self.app.direct_route.stats())
+
+        if path == "/direct/verify" and method == "POST":
+            host = payload.get("host")
+            if host is not None and not isinstance(host, str):
+                return json_response({"error": "invalid_host"}, 400)
+            try:
+                limit = int(payload.get("limit", 6))
+                result = await self.app.direct_route.verify(host=host, limit=limit)
+            except (TypeError, ValueError) as exc:
+                return json_response({"error": str(exc)}, 400)
+            return json_response(result)
 
         if path == "/sources" and method == "GET":
             return json_response(self.app.public_sources.status())
@@ -1732,6 +1788,7 @@ class App:
         self.public_sources = PublicSourceManager(
             cfg.get("public_sources", []), self.pool, self.checker, split_proxy_text, log)
         self.direct_nodes = DirectNodeStore(cfg.get("direct_nodes", {}))
+        self.direct_route = DirectRouteManager(self.direct_nodes, cfg.get("direct_nodes", {}))
         self.gateway: Optional[Gateway] = None
         self.api = ApiServer(cfg, self)
         self.servers: list[asyncio.AbstractServer] = []
@@ -1813,7 +1870,7 @@ class App:
     async def start(self) -> None:
         c = self.cfg
         if c["gateway"]["enabled"]:
-            self.gateway = Gateway(c, self.pool, self.checker)
+            self.gateway = Gateway(c, self.pool, self.checker, self.direct_route)
             srv = await asyncio.start_server(self.gateway.handle,
                                              c["gateway"]["host"],
                                              c["gateway"]["port"], limit=MAX_HEAD)
