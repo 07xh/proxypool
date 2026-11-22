@@ -4,6 +4,7 @@
 import asyncio
 import os
 import sqlite3
+from contextlib import closing
 import ssl
 import tempfile
 import unittest
@@ -48,7 +49,7 @@ class Tests(unittest.TestCase):
             app = self.make_app(path)
             app.pool.add_many([entry])
             self.assertEqual(app.pool.proxies[0].password, "privatepass")
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection:
                 stored = connection.execute(
                     "SELECT user,password FROM proxies LIMIT 1").fetchone()
             self.assertEqual(stored, ("", ""))
