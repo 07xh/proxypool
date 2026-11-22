@@ -91,7 +91,7 @@ class Tests(unittest.TestCase):
             app.pool.add_many([{"scheme": "http", "host": "proxy.invalid", "port": 8080}])
             proxy = app.pool.proxies[0]
             for method, expected in (("POST", 1), ("PUT", 1), ("PATCH", 1),
-                                     ("DELETE", 1), ("GET", 3), ("HEAD", 3)):
+                                     ("DELETE", 1), ("GET", 1), ("HEAD", 1)):
                 proxy.state = "alive"
                 proxy.consec_fail = 0
                 gateway = StubGateway(app.cfg, app.pool, app.checker)
@@ -126,9 +126,12 @@ class Tests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def get(self, session=None):
+            def get(self, session=None, exclude_ids=None):
                 self.calls += 1
-                return {"id": 1, "url": "http://proxy.invalid:8080"}
+                for pid in (1, 2, 3):
+                    if pid not in (exclude_ids or set()):
+                        return {"id": pid, "url": f"http://proxy{pid}.invalid:8080"}
+                raise poolclient.NoProxyAvailable("all unique proxies exhausted")
 
             def report(self, *args, **kwargs):
                 pass
@@ -147,7 +150,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         calls.clear()
         poolclient.request_with_rotation(callback, client, method="GET", attempts=3, backoff=0)
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls, [1, 2, 3])
 
 
 if __name__ == "__main__":

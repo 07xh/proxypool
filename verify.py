@@ -10,6 +10,10 @@ import os
 import subprocess
 import sys
 
+# Some Windows CI terminals default to cp1252 and cannot print Chinese text.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -18,7 +22,9 @@ def run(name, script, args=None):
     print(f"  {name}")
     print("=" * 66)
     cmd = [sys.executable, os.path.join(HERE, script)] + (args or [])
-    r = subprocess.run(cmd, cwd=HERE)
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    r = subprocess.run(cmd, cwd=HERE, env=env)
     ok = r.returncode == 0
     print(f"  -> {name}: {'OK' if ok else 'FAILED'} (exit={r.returncode})")
     return ok

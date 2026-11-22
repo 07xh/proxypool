@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUTF8: '1'
+
 jobs:
   test:
     name: Python 3.11 / ${{ matrix.os }}
