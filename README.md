@@ -447,3 +447,40 @@ python verify.py           # 全套：内置自测 + 安全回归 + 端到端冒
 - **离线测试**：`rotation_test.py` 通过模拟代理和本地 SDK 校验排除、粘性会话、禁用节点统计、客户端方法与 HTTP 429 不自动重试。运行 `python verify.py`。
 
 **说明**：上述是代码改动及测试用例，不代表公网代理或 Windows EXE 已通过实际运行验收。
+
+## 十九、CDN 直连节点（与代理池隔离）
+
+这是独立的**目标站直连 TLS 端点目录**，不能作为 HTTP/SOCKS5 代理使用，也不会进入 `/get`、`/all`、代理健康检查、网关或自动轮换流程。
+
+- **原通用代理池**：`proxies.local.txt`，由原有接口和网关管理。
+- **目标直连节点**：`direct_nodes.local.txt`，格式为 `ip,port,sni,latency_ms,response_bytes`，本机保存且已加入 `.gitignore`。
+- Windows 桌面管理界面新增 **CDN 直连节点** 页和 **导入直连节点** 按钮，可以直接选择本机已有的 `cdn_nodes.txt`（或相同结构的 JSON）；不会把节点改写成代理。
+- 只接收 `pool.json` 的 `direct_nodes.allowed_hosts` 明确允许的 SNI，默认 `kyfw.12306.cn`。其他目标须明确修改允许列表。
+- 来源是用户**本地导入的历史实测记录**。导入不会重新联网测活；`fresh` 只表示数据时间在 72 小时之内，**不代表此刻节点健康**。
+- JSON 如含 `generated` 则按采集时间判断新鲜度；TXT 按源文件修改时间判断（桌面导入时保留原时间）。超时仍能查看记录，但 `/direct/get` 返回 503。
+
+示例查询（守护进程运行后）：
+
+```bash
+curl http://127.0.0.1:18081/direct/stats
+curl http://127.0.0.1:18081/direct/all
+curl 'http://127.0.0.1:18081/direct/get?host=kyfw.12306.cn'
+curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:18081/direct/reload
+```
+
+或者：
+
+```python
+from poolclient import ProxyPoolClient
+client = ProxyPoolClient()
+print(client.direct_stats())
+node = client.direct_get("kyfw.12306.cn")
+# node == {"type": "direct_tls", "ip": "...", "port": 443,
+#          "sni": "kyfw.12306.cn", "latency_ms": ..., "response_bytes": ...,
+#          "is_proxy": False}
+# 不要传入 requests 的 proxies 参数。
+```
+
+未随仓库提交用户的 171 条节点记录及本地采集脚本；本仓库无法访问用户 Windows 上的绝对路径。现阶段实现**导入、隔离、目录/API 取用和新鲜度检查**，未实现自动 ECS 采集、定期在线测活、目标业务的请求发送或 ticket 业务逻辑。需要对 TLS 端点发起合法请求的宿主程序，应按 SNI 域名严格校验证书，**不得使用** `CERT_NONE`、`verify=False`；同时遵守目标网站的使用规则。stunnel 本身不提供 SOCKS5 代理协议。
+
+离线测试：`python direct_nodes_test.py`，也已纳入 `python verify.py` 和 CI。

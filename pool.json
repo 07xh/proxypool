@@ -51,6 +51,11 @@
     }
   ],
   "log_level": "info",
+  "direct_nodes": {
+    "path": "direct_nodes.local.txt",
+    "allowed_hosts": ["kyfw.12306.cn"],
+    "max_age_hours": 72
+  },
   "public_sources": [
     {
       "name": "monosans-http",

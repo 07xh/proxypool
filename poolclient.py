@@ -38,6 +38,10 @@ class NoProxyAvailable(RuntimeError):
     """池子里一条可用代理都没有。宿主可据此降级为直连或暂停任务。"""
 
 
+class NoDirectNodeAvailable(RuntimeError):
+    """指定目标没有新鲜的直连 TLS 节点。这不是代理池错误。"""
+
+
 class ProxyPoolClient:
     def __init__(self, api_base: str = DEFAULT_API, token: str = "",
                  timeout: float = 5.0) -> None:
@@ -103,6 +107,29 @@ class ProxyPoolClient:
 
     def get_curl_arg(self) -> str:
         return self._req("/get?format=curl").strip()
+
+    # ── 直连 TLS 节点（与代理取用完全隔离） ──
+    def direct_stats(self) -> dict:
+        return self._req("/direct/stats")
+
+    def direct_list(self, host: Optional[str] = None) -> list[dict]:
+        path = "/direct/all"
+        if host:
+            path += "?" + urllib.parse.urlencode({"host": host})
+        return self._req(path).get("nodes", [])
+
+    def direct_get(self, host: str) -> dict:
+        """Return IP/port/SNI metadata, not an HTTP or SOCKS proxy URL."""
+        path = "/direct/get?" + urllib.parse.urlencode({"host": host})
+        try:
+            return self._req(path)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 503):
+                raise NoDirectNodeAvailable(f"direct TLS node unavailable for {host}") from None
+            raise
+
+    def direct_reload(self) -> dict:
+        return self._req("/direct/reload", {})
 
     # ── 上报 ──
     def report(self, proxy_id: int, ok: bool, latency_ms: float = 0.0) -> dict:
