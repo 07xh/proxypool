@@ -5,10 +5,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'manager_gui.py'
-      - 'poolsd.py'
-      - 'public_sources.py'
-      - 'poolclient.py'
+      - '**.py'
       - 'pool.json'
       - 'build_windows.cmd'
       - '.github/workflows/proxypool-desktop.yml'
