@@ -176,7 +176,7 @@ class GatewayRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.direct_route.matches(HOST))
                 reply = await app.api._route("POST", "/direct/verify", {},
                                               {"host": "unapproved.example"})
-                self.assertIn(b"400 Bad Request", reply)
+                self.assertTrue(reply.startswith(b"HTTP/1.1 400 "), reply[:80])
                 self.assertEqual(len(app.pool.proxies), 0)
             finally:
                 app.store.close()
