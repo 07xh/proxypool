@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from poolsd import DEFAULT_CONFIG, ProxyPool, Store
@@ -103,7 +104,7 @@ def verify():
             ])
             for item in meter.proxies:
                 item.state = "alive"
-                item.last_ok = __import__("time").time()
+                item.last_ok = time.time()
             measured = meter.stats()
             assert measured["total"] == 5, measured
             assert measured["alive"] == 5, measured
@@ -111,8 +112,8 @@ def verify():
             assert measured["unique_public_ipv4_alive"] == 2, measured
             assert measured["unique_public_ipv4_verified_5m"] == 2, measured
             meter.proxies[2].enabled = False
-            meter.proxies[0].last_ok = __import__("time").time() - 400
-            meter.proxies[1].last_ok = __import__("time").time() - 400
+            meter.proxies[0].last_ok = time.time() - 400
+            meter.proxies[1].last_ok = time.time() - 400
             measured = meter.stats()
             assert measured["unique_public_ipv4_total"] == 2, measured
             assert measured["unique_public_ipv4_alive"] == 1, measured
