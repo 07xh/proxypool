@@ -484,3 +484,44 @@ node = client.direct_get("kyfw.12306.cn")
 未随仓库提交用户的 171 条节点记录及本地采集脚本；本仓库无法访问用户 Windows 上的绝对路径。现阶段实现**导入、隔离、目录/API 取用和新鲜度检查**，未实现自动 ECS 采集、定期在线测活、目标业务的请求发送或 ticket 业务逻辑。需要对 TLS 端点发起合法请求的宿主程序，应按 SNI 域名严格校验证书，**不得使用** `CERT_NONE`、`verify=False`；同时遵守目标网站的使用规则。stunnel 本身不提供 SOCKS5 代理协议。
 
 离线测试：`python direct_nodes_test.py`，也已纳入 `python verify.py` 和 CI。
+
+
+## 二十、普通代理清单导入与独立 IPv4 统计（2026-11-22）
+
+**这是普通 HTTP / HTTPS / SOCKS5 代理池功能，不涉及 CDN 直连端点。**
+
+Windows 管理页的「代理列表」新增「导入普通代理 TXT」：用户选择已有的本地代理清单，一行一个地址。界面校验协议、端口、去重，并将新增项目追加到应用私有的 `proxies.local.txt`，同时通过本地 `/add` 接入运行中的池。不会覆盖旧条目；原有 `/check` 按钮可立即触发健康检测。如服务未启动，清单仍保存在本机，待下次启动读取。
+
+**导入安全边界**：对包含用户名/密码的代理必须先设置本地 API Token；明文认证信息仍会保存在本机私有清单中，请自行保护文件权限。公共免费代理不可信，不应用来传输身份凭据。导入仅表示解析/入库，不等于代理已通过联网检测。
+
+`GET /stats` 原有字段保持不变，新添：
+
+| 字段 | 说明 |
+|---|---|
+| `total` | 全部代理条目数，按协议+主机+端口去重 |
+| `alive` | 目前处于健康、已启用状态的代理条目数 |
+| `unique_public_ipv4_total` | 池中去重后公网 IPv4 字面地址数量，不含主机名和保留地址 |
+| `unique_public_ipv4_alive` | 健康、已启用代理中的去重公网 IPv4 数量 |
+| `unique_public_ipv4_verified_5m` | 健康、已启用且最近 300 秒内成功检测的去重公网 IPv4 数量 |
+
+同一 IP 的不同端口、HTTP/SOCKS5 两种协议会形成**多个代理条目，但只算一个独立公网 IPv4**。主机名对应的真实出口 IP 未经解析和目标端检测，故不计入统计。这些都是本机状态快照，不保证第三方代理此刻一定可用或出口 IP 与入口 IP 完全一致。
+
+Prometheus `/metrics` 同步新增三个 `proxy_pool_unique_public_ipv4_*` 指标。Windows 管理界面运行概览显示「代理条目 / 健康条目 / 独立公网 IPv4 / 近 5 分钟验证」。
+
+SDK 直接读取而不自行重复统计：
+
+```python
+from poolclient import ProxyPoolClient
+
+client = ProxyPoolClient("http://127.0.0.1:18081", token="")
+stats = client.stats()
+print("代理条目:", stats["total"])
+print("健康条目:", stats["alive"])
+print("近五分钟验证公网 IPv4:", client.public_ipv4_count())
+print("代理源状态:", client.source_status())
+
+# 只在需要时主动刷新已配置的公开来源
+# client.refresh_sources()
+```
+
+本项目只提供网络代理基础设施和来源检测，**不包含自动注册、批量创建账号或绕过目标平台限制的流程**。参见 `rotation_test.py` 中统计去重与 SDK 单测。
