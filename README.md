@@ -525,3 +525,27 @@ print("代理源状态:", client.source_status())
 ```
 
 本项目只提供网络代理基础设施和来源检测，**不包含自动注册、批量创建账号或绕过目标平台限制的流程**。参见 `rotation_test.py` 中统计去重与 SDK 单测。
+
+
+## 直连节点运行时整合（原私人仓库功能，安全修订）
+
+原私人仓库引入了域名匹配、IP+SNI+Host 的直连节点、故障冷却和节点复测。
+这里保留公有仓库已有的唯一 `DirectNodeStore`，新增 `direct_route.py` 记录
+运行时健康信息；**不会将 CDN 直连 IP 写入 HTTP/SOCKS 代理列表**。
+
+- 输入支持 `ip,port,sni,latency_ms,bytes` 以及旧版 `host,sni,ip,port,latency_ms,bytes`。
+  为避免目标混淆，新版要求 Host 与 SNI 一致，且只导入明确允许的公网 IPv4。
+- 在 `pool.json` 的 `direct_nodes.route_enabled` 设置为 true 才路由，默认 false。
+  只有节点清单未过期且请求 CONNECT 的目标与白名单精确匹配、端口为 443 时启用。
+- 经网关转发时先与节点建立**原始 TCP 连接**，不是提前在服务器端建立 TLS；
+  原 HTTPS 客户端自己发起 SNI 和证书校验，不会出现 TLS 套 TLS 的协议错误。
+- 单次 CONNECT 不重复尝试同一节点；失败时独立计数与熔断，冷却过后可以重新尝试。
+  直连都失败则按照原网关规则回落 HTTP/SOCKS 代理池。
+- `POST /direct/verify` 可由桌面手动触发最多 12 个、逐个执行的 HTTPS HEAD
+  检查，Python 系统 CA 默认校验证书链和域名；自动启动时不做这项网络检测。
+  `/direct/all` 返回每条节点的历史与实时状态，`/direct/stats` 包含独立路由指标。
+- `POST /direct/route`（JSON：`{"enabled":true|false}`）仅更改运行状态；
+  桌面开关同时把设置写入本机配置以便下次启动继续生效。
+- `POST /direct/reload` 从本地导入历史记录，不会把以前的采集数据直接认作实时检测通过。
+  如需迁移旧版节点表，从 GUI“导入节点清单”选择 TXT/CSV/JSON。
+- 不复制私人仓库里未经重新验证的历史节点 IP；没有测试结果前不声称这些节点可以访问目标。

@@ -78,7 +78,6 @@ class Manager:
             ("启动服务", self.start),
             ("停止服务", self.stop),
             ("刷新公开来源", lambda: self.post("/sources/refresh", {})),
-            ("导入直连节点", self.import_nodes),
             ("重新检测", lambda: self.post("/check", {"scope": "all"}, 180)),
             ("刷新显示", lambda: self.poll(True)),
         ):
@@ -111,9 +110,20 @@ class Manager:
             [165, 90, 65, 90, 70, 75, 75, 300])
         self.direct_summary = tk.StringVar(value="尚未导入直连节点")
         ttk.Label(direct_tab, textvariable=self.direct_summary).pack(fill="x", pady=(0, 7))
+        direct_bar = ttk.Frame(direct_tab)
+        direct_bar.pack(fill="x", pady=(0, 7))
+        ttk.Button(direct_bar, text="导入节点清单", command=self.import_nodes).pack(side="left", padx=3)
+        ttk.Button(direct_bar, text="安全验证前 6 条", command=lambda:
+                   self.post("/direct/verify", {"limit": 6}, 130)).pack(side="left", padx=3)
+        self.direct_toggle_button = ttk.Button(direct_bar, text="启用直连路由",
+                                                command=self.toggle_direct_routing)
+        self.direct_toggle_button.pack(side="left", padx=3)
+        ttk.Label(direct_tab,
+            text="直连节点仅用于允许域名的 HTTPS；非代理 IP。启用后客户端自行进行 TLS 证书验证。",
+            foreground="#96641b").pack(fill="x", pady=(0, 7))
         self.direct_table = self.create_table(direct_tab,
-            ["IP", "端口", "SNI 域名", "记录延迟(ms)", "响应字节", "类型"],
-            [170, 75, 260, 135, 125, 125])
+            ["IP", "端口", "SNI 域名", "历史延迟", "检测延迟", "检测状态", "证书"],
+            [150, 70, 220, 110, 110, 130, 100])
         ttk.Label(outer, text="注意：公开代理是不可信的第三方服务，不要用于登录账号或传输个人信息。",
                   foreground="#96641b").pack(anchor="w", pady=(8, 3))
         self.status = tk.StringVar(value=f"配置及数据库目录：{self.home}")
@@ -251,6 +261,27 @@ class Manager:
         except (OSError, ValueError, UnicodeError) as exc:
             messagebox.showerror("导入失败", str(exc))
 
+    def toggle_direct_routing(self):
+        """Change only this app's opt-in local setting and running state."""
+        currently_enabled = bool(self.config.get("direct_nodes", {}).get("route_enabled", False))
+        enable = not currently_enabled
+        if enable and not messagebox.askyesno(
+            "启用直连路由",
+            "仅允许指定 HTTPS 域名使用直连节点。直连节点不是 HTTP/SOCKS 代理，"
+            "可能失败并回退原代理池。确认启用？"):
+            return
+        try:
+            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+            cfg.setdefault("direct_nodes", {})["route_enabled"] = enable
+            tmp = self.config_path.with_name(self.config_path.name + ".tmp")
+            tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            tmp.replace(self.config_path)
+            self.config = poolsd.load_config(str(self.config_path))
+            self.post("/direct/route", {"enabled": enable})
+        except (OSError, ValueError, TypeError) as exc:
+            messagebox.showerror("直连路由配置失败", str(exc))
+
     def start(self):
         if self.closing:
             return
@@ -354,13 +385,18 @@ class Manager:
                          s.get("available_now"), s.get("error") or "")
                         for s in sources])
                     self.direct_summary.set(
-                        f"历史节点 {direct_stats.get('total', 0)}  "
-                        f"新鲜度 {'未过期' if direct_stats.get('fresh') else '已过期/未导入'}  "
-                        f"采集时间 {direct_stats.get('generated_at') or '未知'}  "
-                        f"实时检测：未执行（{direct_stats.get('error') or '无错误'}）")
+                        f"节点 {direct_stats.get('total', 0)}  "
+                        f"可尝试 {direct_stats.get('eligible', 0)}  "
+                        f"HTTPS 验证通过 {direct_stats.get('https_verified', 0)}  "
+                        f"冷却 {direct_stats.get('cooldown', 0)}  "
+                        f"路由 {'已启用' if route_enabled else '关闭'}  "
+                        f"记录 {'有效' if direct_stats.get('fresh') else '过期/未导入'}"
+                        + (f"  错误: {direct_stats['error']}" if direct_stats.get("error") else ""))
                     self.fill(self.direct_table, [
-                        (n.get("ip"), n.get("port"), n.get("sni"), n.get("latency_ms"),
-                         n.get("response_bytes"), "直连 TLS（非代理）")
+                        (n.get("ip"), n.get("port"), n.get("sni"),
+                         n.get("latency_ms"), n.get("route_latency_ms") or "-",
+                         n.get("route_state", "untested"),
+                         "已验证" if n.get("https_verified") else "未验证")
                         for n in direct_nodes[:1000]])
                 elif event == "offline":
                     self.summary.set("本地 API 尚未连接")
