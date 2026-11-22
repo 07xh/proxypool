@@ -37,6 +37,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from public_sources import PublicSourceManager
+from direct_nodes import DirectNodeStore
 
 VERSION = "1.0.0"
 CHUNK = 65536
@@ -90,6 +91,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "persist_credentials": False,
     },
     "public_sources": [],  # optional public HTTPS feeds; disabled unless configured
+    "direct_nodes": {"path": "direct_nodes.local.txt", "allowed_hosts": ["kyfw.12306.cn"], "max_age_hours": 72},
     "sources": [],   # [{"type":"file","path":"proxies.txt","interval":0},
                      #  {"type":"url","url":"http://...","interval":600}]
     "log_level": "info",
@@ -1528,6 +1530,29 @@ class ApiServer:
         if path == "/stats":
             return json_response(pool.stats())
 
+        # TLS endpoints are not proxies: never mix into /get, /all, checker or gateway.
+        if path == "/direct/stats" and method == "GET":
+            return json_response(self.app.direct_nodes.stats())
+
+        if path == "/direct/all" and method == "GET":
+            host = query.get("host", [None])[0]
+            nodes = self.app.direct_nodes.all(host)
+            return json_response({"count": len(nodes), "nodes": nodes,
+                                  "fresh": self.app.direct_nodes.is_fresh(),
+                                  "live_verified": False})
+
+        if path == "/direct/get" and method == "GET":
+            host = query.get("host", [""])[0]
+            if not host or host not in self.app.direct_nodes.allowed_hosts:
+                return json_response({"error": "host_not_allowed"}, 400)
+            node = self.app.direct_nodes.get(host)
+            if node is None:
+                return json_response({"error": "no_fresh_direct_node"}, 503)
+            return json_response(node)
+
+        if path == "/direct/reload" and method == "POST":
+            return json_response(self.app.direct_nodes.reload())
+
         if path == "/sources" and method == "GET":
             return json_response(self.app.public_sources.status())
 
@@ -1706,6 +1731,7 @@ class App:
         self.checker = Checker(cfg, self.pool)
         self.public_sources = PublicSourceManager(
             cfg.get("public_sources", []), self.pool, self.checker, split_proxy_text, log)
+        self.direct_nodes = DirectNodeStore(cfg.get("direct_nodes", {}))
         self.gateway: Optional[Gateway] = None
         self.api = ApiServer(cfg, self)
         self.servers: list[asyncio.AbstractServer] = []
