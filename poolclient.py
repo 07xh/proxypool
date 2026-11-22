@@ -148,6 +148,26 @@ class ProxyPoolClient:
     def alive(self) -> list:
         return self._req("/all?alive=1")["proxies"]
 
+    def source_status(self) -> list[dict]:
+        """Read public feed statistics; no proxy traffic or refresh triggered."""
+        return self._req("/sources").get("sources", [])
+
+    def refresh_sources(self, name: Optional[str] = None) -> dict:
+        """Refresh configured public proxy feeds explicitly."""
+        payload = {} if name is None else {"name": name}
+        return self._req("/sources/refresh", payload)
+
+    def public_ipv4_count(self, recent_only: bool = True) -> int:
+        """Distinct globally routable IPv4 count, not proxy endpoint count.
+
+        recent_only counts healthy addresses verified in the past five minutes.
+        Hostname-only proxies cannot be resolved to unique IPs from pool data.
+        """
+        stats = self.stats()
+        key = ("unique_public_ipv4_verified_5m" if recent_only
+               else "unique_public_ipv4_alive")
+        return int(stats.get(key, 0))
+
     def add(self, proxies: list) -> dict:
         return self._req("/add", {"proxies": proxies})
 
