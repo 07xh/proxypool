@@ -1,5 +1,7 @@
 # User configuration, proxy credentials and runtime data
 proxies.local.txt
+direct_nodes.local.txt
+direct_nodes.local.json
 pool.local.json
 *.secrets.json
 .env
