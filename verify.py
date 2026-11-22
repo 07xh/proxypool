@@ -38,6 +38,7 @@ def main():
     results.append(("HTTP 报文边界测试", run("报文边界", "framing_test.py")))
     results.append(("响应完整性与超时测试", run("响应与超时", "response_test.py")))
     results.append(("公开来源离线回归", run("公开来源", "public_sources_test.py")))
+    results.append(("CDN 直连节点隔离回归", run("直连节点", "direct_nodes_test.py")))
     results.append(("调度会话与客户端回归", run("调度会话", "rotation_test.py")))
     if not fast:
         results.append(("端到端冒烟（真实进程/端口）", run("端到端冒烟", "smoke.py")))
