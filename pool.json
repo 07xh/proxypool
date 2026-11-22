@@ -1,0 +1,72 @@
+{
+  "api": {
+    "host": "127.0.0.1",
+    "port": 18081,
+    "token": ""
+  },
+  "gateway": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 18080,
+    "auth": "",
+    "max_retry": 2,
+    "retry_on_status": [
+      502,
+      503,
+      504
+    ],
+    "direct_fallback": false,
+    "connect_timeout": 15,
+    "idle_timeout": 120
+  },
+  "checker": {
+    "enabled": true,
+    "interval": 120,
+    "concurrency": 64,
+    "timeout": 8,
+    "targets": [
+      "http://www.gstatic.com/generate_204",
+      "http://httpbin.org/ip"
+    ],
+    "expect_contains": "",
+    "startup_sweep": true,
+    "max_bytes": 32768
+  },
+  "pool": {
+    "strategy": "weighted_random",
+    "sticky_ttl": 300,
+    "allow_cold_start": true,
+    "max_dead_retry": 3
+  },
+  "storage": {
+    "db": "proxies.db",
+    "flush_interval": 5,
+    "persist_credentials": false
+  },
+  "sources": [
+    {
+      "type": "file",
+      "name": "local-list",
+      "path": "proxies.local.txt"
+    }
+  ],
+  "log_level": "info",
+  "public_sources": [
+    {
+      "name": "monosans-http",
+      "url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+      "scheme": "http",
+      "enabled": true,
+      "interval": 1800,
+      "max_entries": 80
+    },
+    {
+      "name": "monosans-socks5",
+      "url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+      "scheme": "socks5",
+      "enabled": true,
+      "interval": 1800,
+      "max_entries": 80
+    }
+  ]
+}
