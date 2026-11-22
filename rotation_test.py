@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from poolsd import DEFAULT_CONFIG, ProxyPool, Store
-from poolclient import NoProxyAvailable, request_with_rotation
+from poolclient import NoProxyAvailable, ProxyPoolClient, request_with_rotation
 
 
 class FakeClient:
@@ -89,7 +90,52 @@ def verify():
         result = request_with_rotation(rate_limited, fake, attempts=5,
                                        method="GET", backoff=0)
         assert result.status_code == 429 and seen == [11]
-        print("rotation/session regression: OK")
+
+        # Distinct IPs are not interchangeable with endpoint counts.
+        meter_store = Store(":memory:")
+        try:
+            meter = ProxyPool(cfg, meter_store)
+            meter.add_many([
+                {"scheme": "http", "host": "1.1.1.1", "port": 8080},
+                {"scheme": "socks5", "host": "1.1.1.1", "port": 1080},
+                {"scheme": "http", "host": "8.8.8.8", "port": 3128},
+                {"scheme": "http", "host": "192.0.2.55", "port": 8080},
+                {"scheme": "http", "host": "proxy.example", "port": 8080},
+            ])
+            for item in meter.proxies:
+                item.state = "alive"
+                item.last_ok = time.time()
+            measured = meter.stats()
+            assert measured["total"] == 5, measured
+            assert measured["alive"] == 5, measured
+            assert measured["unique_public_ipv4_total"] == 2, measured
+            assert measured["unique_public_ipv4_alive"] == 2, measured
+            assert measured["unique_public_ipv4_verified_5m"] == 2, measured
+            meter.proxies[2].enabled = False
+            meter.proxies[0].last_ok = time.time() - 400
+            meter.proxies[1].last_ok = time.time() - 400
+            measured = meter.stats()
+            assert measured["unique_public_ipv4_total"] == 2, measured
+            assert measured["unique_public_ipv4_alive"] == 1, measured
+            assert measured["unique_public_ipv4_verified_5m"] == 0, measured
+        finally:
+            meter_store.close()
+
+        client = ProxyPoolClient()
+        calls = []
+        def fake_api(path, data=None):
+            calls.append((path, data))
+            if path == "/stats":
+                return {"unique_public_ipv4_alive": 3,
+                        "unique_public_ipv4_verified_5m": 2}
+            return {"sources": [{"name": "test-feed", "available_now": 1}]}
+        client._req = fake_api
+        assert client.public_ipv4_count() == 2
+        assert client.public_ipv4_count(recent_only=False) == 3
+        assert client.source_status()[0]["name"] == "test-feed"
+        client.refresh_sources("test-feed")
+        assert calls[-1] == ("/sources/refresh", {"name": "test-feed"})
+        print("rotation/session/IP inventory regression: OK")
     finally:
         store.close()
 

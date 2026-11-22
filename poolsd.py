@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import random
@@ -789,8 +790,27 @@ class ProxyPool:
         lat = sorted(p.latency_ms for p in alive if p.latency_ms > 0)
         p50 = lat[len(lat) // 2] if lat else 0.0
         p90 = lat[int(len(lat) * 0.9)] if lat else 0.0
+
+        def distinct_public_ipv4(items: list[Proxy]) -> int:
+            # A proxy endpoint is not a distinct egress IP. Count literal,
+            # globally routable IPv4 addresses only; hostnames are unknown.
+            hosts: set[str] = set()
+            for item in items:
+                try:
+                    address = ipaddress.IPv4Address(item.host)
+                except ipaddress.AddressValueError:
+                    continue
+                if address.is_global:
+                    hosts.add(str(address))
+            return len(hosts)
+
+        recently_verified = [p for p in alive
+                             if p.last_ok > 0 and 0 <= now - p.last_ok <= 300]
         return {
             "total": len(self.proxies),
+            "unique_public_ipv4_total": distinct_public_ipv4(self.proxies),
+            "unique_public_ipv4_alive": distinct_public_ipv4(alive),
+            "unique_public_ipv4_verified_5m": distinct_public_ipv4(recently_verified),
             "enabled": sum(1 for p in self.proxies if p.enabled),
             "by_state": by_state,
             "alive": len(alive),
@@ -1572,6 +1592,12 @@ class ApiServer:
                 f"proxy_pool_total {s['total']}",
                 "# TYPE proxy_pool_alive gauge",
                 f"proxy_pool_alive {s['alive']}",
+                "# TYPE proxy_pool_unique_public_ipv4_total gauge",
+                f"proxy_pool_unique_public_ipv4_total {s['unique_public_ipv4_total']}",
+                "# TYPE proxy_pool_unique_public_ipv4_alive gauge",
+                f"proxy_pool_unique_public_ipv4_alive {s['unique_public_ipv4_alive']}",
+                "# TYPE proxy_pool_unique_public_ipv4_verified_5m gauge",
+                f"proxy_pool_unique_public_ipv4_verified_5m {s['unique_public_ipv4_verified_5m']}",
                 "# TYPE proxy_pool_disabled gauge",
                 f"proxy_pool_disabled {s['total'] - s['enabled']}",
                 "# TYPE proxy_pool_latency_p50_ms gauge",

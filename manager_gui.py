@@ -97,6 +97,12 @@ class Manager:
         tabs.add(proxy_tab, text="代理列表")
         tabs.add(source_tab, text="公开来源")
         tabs.add(direct_tab, text="CDN 直连节点")
+        proxy_actions = ttk.Frame(proxy_tab)
+        proxy_actions.pack(fill="x", pady=(0, 6))
+        ttk.Button(proxy_actions, text="导入普通代理 TXT",
+                   command=self.import_proxies).pack(side="left")
+        ttk.Label(proxy_actions, text="仅 HTTP / HTTPS / SOCKS5；导入后可手动重新检测").pack(
+            side="left", padx=(10, 0))
         self.proxy_table = self.create_table(proxy_tab,
             ["编号", "协议", "地址", "端口", "状态", "延迟(ms)", "来源", "评分"],
             [65, 85, 160, 70, 85, 100, 210, 80])
@@ -139,6 +145,76 @@ class Manager:
                                      method="POST" if data is not None else "GET")
         with self.opener.open(req, timeout=timeout) as response:
             return json.load(response)
+
+    def import_proxies(self):
+        """Import locally supplied proxy endpoints without mixing CDN direct nodes."""
+        filename = filedialog.askopenfilename(
+            title="选择 HTTP / HTTPS / SOCKS5 代理清单",
+            filetypes=[("纯文本代理清单", "*.txt"), ("所有文件", "*.*")])
+        if not filename:
+            return
+        try:
+            source = Path(filename)
+            if source.stat().st_size > 1024 * 1024:
+                raise ValueError("代理清单不能超过 1 MB")
+            lines = source.read_text(encoding="utf-8-sig").splitlines()
+            if len(lines) > 10000:
+                raise ValueError("清单不能超过 10000 行")
+            configured = next(
+                (item.get("path") for item in self.config.get("sources", [])
+                 if item.get("type", "file") == "file" and item.get("path")),
+                "proxies.local.txt")
+            target = Path(configured)
+            target = (target if target.is_absolute() else self.home / target).resolve()
+            if target.parent != self.home.resolve():
+                raise ValueError("普通代理清单只能保存到应用本地数据目录")
+            existing = target.read_text(encoding="utf-8-sig") if target.exists() else ""
+            seen = set()
+            for line in existing.splitlines():
+                item = poolsd.split_proxy_text(line)
+                if item:
+                    seen.add(poolsd.proxy_key(item["scheme"], item["host"], item["port"]))
+            imported, new_lines = [], []
+            rejected = duplicate = 0
+            for raw in lines:
+                raw = raw.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                # Do not silently normalize unsupported protocols to HTTP.
+                scheme = raw.split("://", 1)[0].lower() if "://" in raw else "http"
+                item = poolsd.split_proxy_text(raw)
+                if not item or scheme not in ("http", "https", "socks5") or not (1 <= item["port"] <= 65535):
+                    rejected += 1
+                    continue
+                key = poolsd.proxy_key(item["scheme"], item["host"], item["port"])
+                if key in seen:
+                    duplicate += 1
+                    continue
+                seen.add(key)
+                item["source"] = "local-list"
+                imported.append(item)
+                new_lines.append(raw)
+            if not imported:
+                self.status.set(f"无新增普通代理：重复 {duplicate}，格式不支持 {rejected}")
+                return
+            if any(p["user"] or p["password"] for p in imported) and not self.token:
+                raise ValueError("清单包含账号认证信息；请先为本地管理 API 设置 Token 再导入")
+            if not messagebox.askyesno(
+                "确认导入普通代理",
+                f"新增 {len(imported)} 条，重复 {duplicate} 条，无效 {rejected} 条。"
+                "\n将保存至本机私有文件；仅导入，不保证代理可用。继续？"):
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp")
+            content = existing.rstrip("\n") + ("\n" if existing.strip() else "")
+            content += "\n".join(new_lines) + "\n"
+            tmp.write_text(content, encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(target)
+            self.post("/add", {"proxies": imported})
+            self.status.set(f"已保存 {len(imported)} 条普通代理；健康检测完成后才计入可用数量")
+        except (OSError, ValueError, UnicodeError) as exc:
+            messagebox.showerror("代理导入失败", str(exc))
 
     def import_nodes(self):
         """Import the user's local TXT/CSV/JSON observations without mixing proxies."""
@@ -263,7 +339,9 @@ class Manager:
                 if event == "snapshot":
                     stats, proxies, sources, direct_stats, direct_nodes = value
                     self.summary.set(
-                        f"代理 {stats.get('total', 0)}   可用 {stats.get('alive', 0)}   "
+                        f"代理条目 {stats.get('total', 0)}   健康条目 {stats.get('alive', 0)}   "
+                        f"独立公网 IPv4 {stats.get('unique_public_ipv4_alive', 0)}   "
+                        f"近5分钟验证 {stats.get('unique_public_ipv4_verified_5m', 0)}   "
                         f"P50 {stats.get('latency_p50_ms', 0)} ms   "
                         f"累计成功 {stats.get('total_success', 0)}")
                     self.fill(self.proxy_table, [
