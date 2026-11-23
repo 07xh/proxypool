@@ -33,6 +33,7 @@ def run(name, script, args=None):
 def main():
     fast = "--fast" in sys.argv
     results = []
+    results.append(("配置与本地路径隔离", run("配置隔离", "config_test.py")))
     results.append(("内置自测（组件级）", run("内置自测", "poolsd.py", ["--selftest"])))
     results.append(("安全回归（离线）", run("安全回归", "security_test.py")))
     results.append(("HTTP 报文边界测试", run("报文边界", "framing_test.py")))

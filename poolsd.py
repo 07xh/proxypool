@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import copy
 import ipaddress
 import json
 import os
@@ -136,7 +137,7 @@ def ns(d: Any) -> Any:
 
 
 def load_config(path: Optional[str]) -> dict:
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             cfg = deep_merge(cfg, json.load(f))
@@ -150,6 +151,33 @@ def load_config(path: Optional[str]) -> dict:
     if os.environ.get("PROXYPOOL_DB"):
         cfg["storage"]["db"] = os.environ["PROXYPOOL_DB"]
     return cfg
+
+
+def resolve_runtime_paths(cfg: dict, base_dir: str | os.PathLike) -> dict:
+    """Return an isolated configuration with local file paths anchored to base_dir.
+
+    Desktop backends must not call os.chdir(): the working directory is
+    process-global and changing it on a background thread affects the GUI.
+    URL sources and absolute paths remain unchanged.
+    """
+    out = copy.deepcopy(cfg)
+    base = os.path.abspath(os.fspath(base_dir))
+
+    def anchored(value):
+        if not isinstance(value, str) or not value:
+            return value
+        return value if os.path.isabs(value) else os.path.abspath(os.path.join(base, value))
+
+    for group, field in (("storage", "db"), ("direct_nodes", "path")):
+        section = out.get(group)
+        if isinstance(section, dict) and field in section:
+            section[field] = anchored(section[field])
+
+    for source in out.get("sources", []):
+        if isinstance(source, dict) and source.get("type", "file") == "file":
+            if "path" in source:
+                source["path"] = anchored(source["path"])
+    return out
 
 
 # ───────────────────────────── 工具 ─────────────────────────────

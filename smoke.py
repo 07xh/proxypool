@@ -98,8 +98,12 @@ def main():
     with open(CFG, "w", encoding="utf-8") as f:
         json.dump({
             "api": {"port": 19081, "token": ""},
+            # This suite validates transport and failover, not request timing.
+            # Keep rate-control tests in hardening_test.py to avoid random
+            # long waits during the 24-request Windows CI rotation check.
             "gateway": {"enabled": True, "port": 19080, "max_retry": 2,
-                        "connect_timeout": 5.0, "idle_timeout": 30.0},
+                        "connect_timeout": 5.0, "idle_timeout": 30.0,
+                        "rhythm_enabled": False},
             "checker": {"enabled": False, "interval": 0, "startup_sweep": False,
                         "timeout": 4.0,
                         "targets": ["http://127.0.0.1:19001/echo"]},
