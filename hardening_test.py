@@ -641,7 +641,9 @@ def main() -> int:
     test_pool_wiring()
     test_affinity_in_pick()
     test_gateway_end_to_end()
-    test_poolsd_selftest()
+    # verify.py already runs the daemon selftest; avoid repeating it in the suite.
+    if "--skip-selftest" not in sys.argv:
+        test_poolsd_selftest()
     print("=" * 62)
     if FAILURES:
         print(f"[FAIL] {len(FAILURES)} 项：")

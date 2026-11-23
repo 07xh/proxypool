@@ -4,7 +4,7 @@
 verify.py — 一键验收（三套测试串起来跑，退出码 0 表示全绿）
 
     python verify.py            # 全套
-    python verify.py --fast     # 只跑内置自测（不占端口、不起子进程）
+    python verify.py --fast     # 跳过网关、审计和认证端到端用例，保留基础回归
 """
 import os
 import subprocess
@@ -41,6 +41,7 @@ def main():
     results.append(("CDN 直连节点隔离回归", run("直连节点", "direct_nodes_test.py")))
     results.append(("调度会话与客户端回归", run("调度会话", "rotation_test.py")))
     if not fast:
+        results.append(("代理质量审计与回环集成", run("质量审计", "hardening_test.py", ["--skip-selftest"])))
         results.append(("端到端冒烟（真实进程/端口）", run("端到端冒烟", "smoke.py")))
         results.append(("认证面 + 客户端库", run("认证面", "auth_test.py")))
 
