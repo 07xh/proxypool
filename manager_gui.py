@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import shutil
 import sys
+import time
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -263,14 +264,18 @@ class Manager:
 
     def run_backend(self):
         async def serve():
-            os.chdir(self.home)
-            config = poolsd.load_config(str(self.config_path))
+            config = poolsd.resolve_runtime_paths(
+                poolsd.load_config(str(self.config_path)), self.home)
             self.loop = asyncio.get_running_loop()
             self.stop_event = asyncio.Event()
             app = poolsd.App(config)
             try:
                 await app.start()
-                self.events.put(("status", "代理池正在运行，公开来源在后台获取和检测"))
+                # A close request may arrive during backend startup.
+                if self.closing:
+                    self.stop_event.set()
+                else:
+                    self.events.put(("status", "代理池正在运行，公开来源在后台获取和检测"))
                 await self.stop_event.wait()
             finally:
                 await app.stop()
@@ -375,10 +380,29 @@ class Manager:
         if not self.closing:
             self.root.after(150, self.read_events)
 
+    def _finish_close(self, deadline):
+        thread = self.server_thread
+        if thread is None or not thread.is_alive():
+            self.root.destroy()
+            return
+        if time.monotonic() >= deadline:
+            if messagebox.askyesno(
+                "服务停止超时",
+                "后台仍在停止并保存数据。强制退出可能丢失尚未保存的状态。是否强制退出？"
+            ):
+                self.root.destroy()
+            else:
+                self.root.after(100, lambda: self._finish_close(time.monotonic() + 15))
+            return
+        self.root.after(100, lambda: self._finish_close(deadline))
+
     def close(self):
+        if self.closing:
+            return
         self.closing = True
         self.stop()
-        self.root.after(1200, self.root.destroy)
+        self.status.set("正在等待代理池停止并保存数据……")
+        self._finish_close(time.monotonic() + 15)
 
 
 def main():
