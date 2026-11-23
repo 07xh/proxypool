@@ -17,7 +17,9 @@
     ],
     "direct_fallback": false,
     "connect_timeout": 15,
-    "idle_timeout": 120
+    "idle_timeout": 120,
+    "rhythm_enabled": true,
+    "shape_headers": true
   },
   "checker": {
     "enabled": true,
@@ -29,8 +31,23 @@
       "http://httpbin.org/ip"
     ],
     "expect_contains": "",
+    "content_check": false,
     "startup_sweep": true,
     "max_bytes": 32768
+  },
+  "hardening": {
+    "affinity_ttl": 900,
+    "proxy_cooldown": 60,
+    "rhythm_mu": 1.6,
+    "rhythm_sigma": 0.6,
+    "per_key_qps": 0.5,
+    "global_qps": 2.0,
+    "port_scope_host": "example.com",
+    "port_scope_ports": [
+      22,
+      25,
+      6379
+    ]
   },
   "pool": {
     "strategy": "weighted_random",
@@ -53,7 +70,9 @@
   "log_level": "info",
   "direct_nodes": {
     "path": "direct_nodes.local.txt",
-    "allowed_hosts": ["kyfw.12306.cn"],
+    "allowed_hosts": [
+      "kyfw.12306.cn"
+    ],
     "max_age_hours": 72
   },
   "public_sources": [

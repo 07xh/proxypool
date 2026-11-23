@@ -74,15 +74,27 @@ class ProxyPoolClient:
     # ── 取代理 ──
     def get(self, session: Optional[str] = None,
             strategy: Optional[str] = None,
-            exclude_ids: Optional[set[int]] = None) -> dict:
+            exclude_ids: Optional[set[int]] = None,
+            host: Optional[str] = None,
+            affinity: bool = True) -> dict:
+        """取一条代理。
+
+        host 非空时启用「目标域亲和 + 单出口冷却」：同一站点在窗口内复用同一
+        出口，冷却窗口内不重复压同一出口。affinity=False 只保留冷却，
+        适合并发抓取（并发时绑亲和会把整个站点压到一条线上）。
+        """
         q = {}
         if strategy:
             q["strategy"] = strategy
         if exclude_ids:
             q["exclude"] = ",".join(str(pid) for pid in sorted(exclude_ids))
+        if host:
+            q["host"] = host
         path = "/get"
         if session:
             path = "/get/" + urllib.parse.quote(session, safe="")
+            if not affinity:
+                q["affinity"] = "0"
         if q:
             path += "?" + urllib.parse.urlencode(q)
         try:
@@ -96,14 +108,33 @@ class ProxyPoolClient:
         return res
 
     def get_url(self, session: Optional[str] = None,
-                strategy: Optional[str] = None) -> str:
-        return self.get(session=session, strategy=strategy)["url"]
+                strategy: Optional[str] = None,
+                host: Optional[str] = None) -> str:
+        return self.get(session=session, strategy=strategy, host=host)["url"]
 
-    def get_requests_proxies(self, session: Optional[str] = None) -> dict:
-        """直接喂给 requests 的 proxies= 参数。"""
-        p = self.get(session=session)
+    def get_requests_proxies(self, session: Optional[str] = None,
+                             host: Optional[str] = None) -> dict:
+        """直接喂给 requests 的 proxies= 参数。host 传目标域名即开始做亲和。"""
+        p = self.get(session=session, host=host)
         u = p["url"]
         return {"http": u, "https": u}
+
+    def get_headers(self, session: Optional[str] = None,
+                    host: Optional[str] = None) -> dict:
+        """取该出口对应画像的头（UA / Accept-Language / Client Hints）。
+
+        宿主自己发请求时用这一组头，才能和出口的 TLS 指纹对上；
+        出口是 Chrome 却自己发 curl UA，等于把画像白做了。
+        """
+        p = self.get(session=session, host=host)
+        profile = p.get("profile") or ""
+        from poolopt import FingerprintBook
+        book = FingerprintBook()
+        prof = book.by_name(profile) or book.profiles[0]
+        headers = {"User-Agent": prof.ua, "Accept-Language": prof.lang,
+                   "Accept-Encoding": "gzip, deflate, br"}
+        headers.update(prof.extra)
+        return {"proxy": p, "headers": headers}
 
     def get_curl_arg(self) -> str:
         return self._req("/get?format=curl").strip()
@@ -177,6 +208,27 @@ class ProxyPoolClient:
     def check(self) -> dict:
         return self._req("/check", {"scope": "all"})
 
+    def audit(self, ids: Optional[list] = None, deep: bool = True) -> dict:
+        """五判据全量体检：透明性 / 注入 / 篡改 / 一致性 / 端口面。"""
+        payload = {"ids": ids} if ids else {}
+        return self._req("/audit", payload)
+
+    def audit_detail(self, proxy_id: int) -> dict:
+        return self._req(f"/audit/detail?id={int(proxy_id)}")
+
+    def blacklist(self) -> dict:
+        return self._req("/blacklist")
+
+    def clear_blacklist(self, keys: Optional[list] = None) -> dict:
+        return self._req("/blacklist", {"keys": keys}, method="DELETE")
+
+    def hardening(self) -> dict:
+        return self._req("/hardening")
+
+    def set_rhythm(self, **kwargs) -> dict:
+        """运行时调节律：mu / sigma / per_key_qps / global_qps / affinity_ttl / proxy_cooldown。"""
+        return self._req("/rhythm", kwargs)
+
     def wait_ready(self, min_alive: int = 1, timeout: float = 60.0,
                    poll: float = 1.0) -> dict:
         """等池子热起来，给容器编排 / 宿主启动用。"""
@@ -238,7 +290,8 @@ class GatewaySession:
 def request_with_rotation(fn, client: ProxyPoolClient, session: Optional[str] = None,
                           attempts: int = 3, backoff: float = 0.5,
                           retry_status: tuple = (500, 502, 503, 504),
-                          method: str = ""):
+                          method: str = "",
+                          host: Optional[str] = None):
     """Retry only explicitly declared safe read requests on distinct upstreams.
 
     Pass method="GET" (or HEAD/OPTIONS) to enable retries. Unknown and write
@@ -252,7 +305,7 @@ def request_with_rotation(fn, client: ProxyPoolClient, session: Optional[str] = 
     tried: set[int] = set()
     for i in range(rounds):
         try:
-            p = client.get(session=session, exclude_ids=tried)
+            p = client.get(session=session, exclude_ids=tried, host=host)
         except NoProxyAvailable:
             if last_result is not None:
                 return last_result

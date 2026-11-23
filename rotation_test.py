@@ -20,7 +20,7 @@ class FakeClient:
             {"id": 22, "url": "http://192.0.2.22:8080"},
         ]
 
-    def get(self, session=None, exclude_ids=None):
+    def get(self, session=None, exclude_ids=None, host=None, affinity=True):
         for p in self.pairs:
             if p["id"] not in (exclude_ids or set()):
                 return p

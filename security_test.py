@@ -127,7 +127,7 @@ class Tests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def get(self, session=None, exclude_ids=None):
+            def get(self, session=None, exclude_ids=None, host=None, affinity=True):
                 self.calls += 1
                 for pid in (1, 2, 3):
                     if pid not in (exclude_ids or set()):

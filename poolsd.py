@@ -40,6 +40,11 @@ from typing import Any, Optional
 from public_sources import PublicSourceManager
 from direct_nodes import DirectNodeStore
 
+import poolopt
+from poolopt import (AffinityBook, AnonymityGate, FingerprintBook, Rhythm,
+                     TransportError, canonical, human_delay, shape_request,
+                     shape_ua, tls_context)
+
 VERSION = "1.0.0"
 CHUNK = 65536
 MAX_HEAD = 256 * 1024
@@ -66,6 +71,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "direct_fallback": False,  # 池空 / 全死时是否直连兜底
         "connect_timeout": 15.0,
         "idle_timeout": 120.0,
+        "rhythm_enabled": True,   # 每（目标×出口）令牌桶 + 对数正态抖动
+        "shape_headers": True,    # 按出口画像重排头序、补默认头
+    },
+    "hardening": {
+        "affinity_ttl": 900,      # 目标域亲和窗口（秒）：同域复用同一出口
+        "proxy_cooldown": 60,     # 同一出口对同一目标域的冷却（秒）
+        "rhythm_mu": 1.6,         # 对数正态均值（秒）
+        "rhythm_sigma": 0.6,      # 对数正态 sigma；0 = 固定节律（不推荐）
+        "per_key_qps": 0.5,       # 每（目标×出口）补充速率
+        "global_qps": 2.0,        # 全局补充速率
+        "port_scope_host": "example.com",
+        "port_scope_ports": [22, 25, 6379],
     },
     "checker": {
         "enabled": True,
@@ -77,6 +94,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "http://httpbin.org/ip",
         ],
         "expect_contains": "",  # 非空则要求响应体包含该串（防拦截页冒充健康）
+        "content_check": False,  # L2：与直连基线比 sha256；目标回显请求头/动态内容时须关闭
         "startup_sweep": True,
         "max_bytes": 32768,
     },
@@ -421,7 +439,7 @@ class Proxy:
     __slots__ = ("id", "scheme", "host", "port", "user", "password", "region",
                  "source", "enabled", "state", "latency_ms", "ema_ok", "success",
                  "fail", "consec_fail", "last_ok", "last_check", "dead_until",
-                 "uses", "score")
+                 "uses", "score", "grade", "profile", "audit")
 
     def __init__(self, pid: int, scheme: str, host: str, port: int,
                  user: str = "", password: str = "", region: str = "",
@@ -446,6 +464,9 @@ class Proxy:
         self.dead_until = 0.0
         self.uses = 0
         self.score = 0.5
+        self.grade = ""          # poolopt 五判据结论；空表示尚未体检
+        self.profile = ""        # 指纹桶名，由 FingerprintBook 按 key 固定分配
+        self.audit = {}          # 最近一次体检明细{sub-checks}
 
     @property
     def key(self) -> str:
@@ -467,6 +488,8 @@ class Proxy:
             "source": self.source,
             "enabled": self.enabled,
             "state": self.state,
+            "grade": self.grade,
+            "profile": self.profile,
             "url": proxy_url(self, with_auth),
             "latency_ms": round(self.latency_ms, 1),
             "score": round(self.score, 4),
@@ -620,6 +643,22 @@ class ProxyPool:
         self._rr = 0
         self.dirty = False
         self.total_added = 0
+        # 隐蔽性工程层：画像分桶 / 目标亲和 / 节律配额
+        self.fingerprints = FingerprintBook()
+        opt = cfg.get("hardening") or {}
+        self.affinity = AffinityBook(
+            affinity_ttl=float(opt.get("affinity_ttl", 900.0)),
+            cooldown=float(opt.get("proxy_cooldown", 60.0)))
+        self.rhythm = Rhythm(
+            mu=float(opt.get("rhythm_mu", 1.6)),
+            sigma=float(opt.get("rhythm_sigma", 0.6)),
+            per_key_qps=float(opt.get("per_key_qps", 0.5)),
+            global_qps=float(opt.get("global_qps", 2.0)))
+        # 黑名单：注入/篡改坐实，永不再选（直到人工 clear_blacklist）
+        self.blacklist: set[str] = set()
+        for proxy in self.proxies:
+            if not proxy.profile:
+                proxy.profile = self.fingerprints.assign(proxy.key).name
 
     # —— 增删 ——
     def add_many(self, entries: list[dict]) -> tuple[int, int]:
@@ -642,6 +681,7 @@ class ProxyPool:
             p = Proxy(pid, e["scheme"], e["host"], int(e["port"]),
                       e.get("user", ""), e.get("password", ""),
                       e.get("region", ""), e.get("source", ""), True)
+            p.profile = self.fingerprints.assign(p.key).name
             self.proxies.append(p)
             self.by_id[p.id] = p
             added += 1
@@ -670,6 +710,13 @@ class ProxyPool:
             age = time.time() - p.last_ok
             recency = max(0.0, min(1.0, 1.0 - age / 1800.0))
         s = 0.55 * p.ema_ok + 0.30 * lat_factor + 0.15 * recency
+        # 体检结论直接进权重：degraded 打七折，unusable 打一折，黑名单归零
+        if p.grade == "degraded":
+            s *= 0.7
+        elif p.grade == "unusable":
+            s *= 0.1
+        elif p.grade == "blacklist":
+            s = 0.0
         if p.state == "dead":
             s *= 0.05
         elif p.state == "new":
@@ -705,23 +752,60 @@ class ProxyPool:
         p.score = self._score(p)
         self.dirty = True
 
+    def apply_audit(self, p: Proxy, record: dict) -> dict:
+        """把五判据结论写回池子；注入/篡改坐实的代理永久移出选路。"""
+        p.grade = record.get("grade", "")
+        p.audit = record
+        if p.grade == "blacklist":
+            self.blacklist.add(p.key)
+            p.enabled = False
+            self.store.set_enabled(p.id, False)
+            p.state = "dead"
+            p.dead_until = time.time() + 86400.0
+        elif p.state == "new" and p.grade in ("usable", "degraded"):
+            p.state = "alive"
+        p.score = self._score(p)
+        self.dirty = True
+        return {"id": p.id, "grade": p.grade, "score": p.score,
+                "blacklist_size": len(self.blacklist)}
+
+    def clear_blacklist(self, keys: Optional[list[str]] = None) -> int:
+        """人工复核后放行：keys 为空则整表清空。"""
+        if keys is None:
+            freed = list(self.blacklist)
+            self.blacklist.clear()
+        else:
+            freed = [k for k in keys if k in self.blacklist]
+            for k in freed:
+                self.blacklist.discard(k)
+        for p in self.proxies:
+            if p.key in freed:
+                p.enabled = True
+                self.store.set_enabled(p.id, True)
+                p.state = "new"
+                p.dead_until = 0.0
+                p.grade = ""
+                p.score = 0.5
+        self.dirty = True
+        return len(freed)
+
     # —— 选路 ——
     def candidates(self) -> list[Proxy]:
         now = time.time()
-        alive = [p for p in self.proxies
-                 if p.enabled and p.state == "alive" and p.dead_until <= now]
+        pool = [p for p in self.proxies
+                if p.enabled and p.key not in self.blacklist
+                and p.grade != "blacklist"]
+        alive = [p for p in pool if p.state == "alive" and p.dead_until <= now]
         if alive:
             return alive
-        prob = [p for p in self.proxies
-                if p.enabled and p.state == "probation" and p.dead_until <= now]
+        prob = [p for p in pool if p.state == "probation" and p.dead_until <= now]
         if prob:
             return prob
-        revive = [p for p in self.proxies
-                  if p.enabled and p.state == "dead" and p.dead_until <= now]
+        revive = [p for p in pool if p.state == "dead" and p.dead_until <= now]
         if revive:
             return revive
         if self.allow_cold_start:
-            return [p for p in self.proxies if p.enabled and p.state == "new"]
+            return [p for p in pool if p.state == "new"]
         return []
 
     def _select(self, cand: list[Proxy], strategy: str) -> Proxy:
@@ -746,20 +830,47 @@ class ProxyPool:
 
     def pick(self, strategy: Optional[str] = None,
              session_key: Optional[str] = None,
-             exclude_ids: Optional[set[int]] = None) -> Optional[Proxy]:
-        """Select an eligible proxy; a retry must not return one already attempted."""
+             exclude_ids: Optional[set[int]] = None,
+             host: Optional[str] = None,
+             affinity: bool = True) -> Optional[Proxy]:
+        """Select an eligible proxy; a retry must not return one already attempted.
+
+        host 非空时叠加两件事：
+          ① 单出口冷却——冷却窗口内不重复承接同一目标域，防单 IP 高频（默认生效）；
+          ② 目标域亲和——窗口内复用同一出口（affinity=True 时生效）。
+        affinity 只给「有登录态/有流程连续性」的场合用；网关裸请求传 False，
+        否则同一目标域的并发请求会全部压到一条线上。
+        """
         excluded = exclude_ids or set()
         now = time.time()
         if session_key:
             hit = self._sessions.get(session_key)
             if hit and hit[1] > now and hit[0] not in excluded:
                 p = self.by_id.get(hit[0])
-                if p and p.enabled and p.state != "dead":
+                if p and p.enabled and p.state != "dead" and p.key not in self.blacklist:
+                    return p
+        if host and affinity:
+            bound = self.affinity.affinity(host)
+            if bound:
+                p = next((x for x in self.proxies if x.key == bound), None)
+                if (p and p.enabled and p.state != "dead" and p.id not in excluded
+                        and p.key not in self.blacklist):
+                    self.affinity.touch(host, p.key)
+                    if session_key:
+                        self._sessions[session_key] = (p.id, now + self.sticky_ttl)
                     return p
         cand = [p for p in self.candidates() if p.id not in excluded]
+        if host and cand:
+            cooled = [p for p in cand if not self.affinity.cooling(host, p.key)]
+            if cooled:
+                cand = cooled
         if not cand:
             return None
         p = self._select(cand, strategy or self.strategy)
+        if host:
+            if affinity:
+                self.affinity.bind(host, p.key)
+            self.affinity.touch(host, p.key)
         if session_key:
             self._sessions[session_key] = (p.id, now + self.sticky_ttl)
         return p
@@ -821,7 +932,25 @@ class ProxyPool:
             "total_uses": sum(p.uses for p in self.proxies),
             "total_success": sum(p.success for p in self.proxies),
             "total_fail": sum(p.fail for p in self.proxies),
+            "blacklist": len(self.blacklist),
+            "by_grade": self._by_grade(),
+            "fingerprints": self._by_profile(),
+            "affinity": self.affinity.stats(),
         }
+
+    def _by_grade(self) -> dict:
+        tally: dict[str, int] = {}
+        for p in self.proxies:
+            key = p.grade or "unchecked"
+            tally[key] = tally.get(key, 0) + 1
+        return tally
+
+    def _by_profile(self) -> dict:
+        tally: dict[str, int] = {}
+        for p in self.proxies:
+            key = p.profile or "unassigned"
+            tally[key] = tally.get(key, 0) + 1
+        return tally
 
     def alive_list(self) -> list[dict]:
         now = time.time()
@@ -918,54 +1047,28 @@ async def open_tunnel(proxy: Proxy, host: str, port: int,
 
 
 async def fetch_via_proxy(proxy: Proxy, url: str, timeout: float = 8.0,
-                          max_bytes: int = 32768) -> tuple[int, list, bytes]:
-    """通过 proxy 取一个 URL，返回 (status, headers, body_prefix)。供健康检查用。"""
-    u = urllib.parse.urlsplit(url)
-    if not u.hostname:
-        raise ValueError(f"bad url: {url}")
-    host = u.hostname
-    port = u.port or (443 if u.scheme == "https" else 80)
-    path = u.path or "/"
-    if u.query:
-        path += "?" + u.query
+                          max_bytes: int = 32768,
+                          profile=None) -> tuple[int, list, bytes]:
+    """通过 proxy 取一个 URL，返回 (status, headers, body_prefix)。
 
-    if proxy.scheme in ("socks5", "socks4") or u.scheme == "https":
-        r, w = await open_tunnel(proxy, host, port, timeout)
-        try:
-            if u.scheme == "https":
-                ctx = verified_tls_context()
-                await asyncio.wait_for(
-                    w.start_tls(ctx, server_hostname=host), timeout)
-            req = (f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\n"
-                   f"User-Agent: {DEFAULT_UA}\r\nAccept: */*\r\n"
-                   f"Connection: close\r\n\r\n")
-            w.write(req.encode("latin-1"))
-            await w.drain()
-            return await asyncio.wait_for(_read_simple_response(r, max_bytes), timeout)
-        finally:
-            try:
-                w.close()
-            except Exception:
-                pass
-
-    # 明文 HTTP 走 absolute-form
-    r, w = await asyncio.wait_for(
-        asyncio.open_connection(proxy.host, proxy.port), timeout)
-    try:
-        lines = [f"GET {url} HTTP/1.1", f"Host: {u.netloc}",
-                 f"User-Agent: {DEFAULT_UA}", "Accept: */*", "Connection: close"]
-        if proxy.user:
-            lines.append(f"Proxy-Authorization: {basic_header(proxy.user, proxy.password)}")
-        lines.append("")
-        lines.append("")
-        w.write("\r\n".join(lines).encode("latin-1"))
-        await w.drain()
-        return await asyncio.wait_for(_read_simple_response(r, max_bytes), timeout)
-    finally:
-        try:
-            w.close()
-        except Exception:
-            pass
+    走 poolopt.proxy_fetch：按出口画像生成头序，https 目标做 CONNECT+TLS，
+    socks5 目标做 SOCKS5 握手（含域名远端解析），不再共用一把全局 UA。
+    """
+    headers = []
+    if profile is not None:
+        headers = [("User-Agent", profile.ua), ("Accept", "*/*"),
+                   ("Accept-Language", profile.lang),
+                   ("Accept-Encoding", "gzip, deflate"),
+                   ("Upgrade-Insecure-Requests", "1")]
+        headers += [(canonical(k), v) for k, v in profile.extra.items()]
+    else:
+        headers = [("User-Agent", DEFAULT_UA), ("Accept", "*/*"),
+                   ("Accept-Language", "en-US,en;q=0.9"),
+                   ("Accept-Encoding", "gzip, deflate")]
+    result = await poolopt.proxy_fetch(proxy, url, timeout=timeout,
+                                       headers=headers, max_body=max_bytes,
+                                       profile=profile)
+    return result["status"], result["headers"], result["body"]
 
 
 async def _read_simple_response(r: asyncio.StreamReader,
@@ -1003,9 +1106,17 @@ class Checker:
         self.targets = list(c["targets"])
         self.expect = c.get("expect_contains", "") or ""
         self.max_bytes = int(c["max_bytes"])
+        self.content_check = bool(c.get("content_check", True))
         self.pool = pool
         self._sem = asyncio.Semaphore(self.concurrency)
         self._rr_target = 0
+        hard = (cfg.get("hardening") or {})
+        self.gate = AnonymityGate(
+            self.targets, timeout=self.timeout, max_body=self.max_bytes,
+            fingerprint=self.pool.fingerprints,
+            port_scope_host=str(hard.get("port_scope_host", "example.com")),
+            port_scope_ports=tuple(int(x) for x in hard.get(
+                "port_scope_ports", [22, 25, 6379])))
 
     def _next_target(self) -> str:
         if not self.targets:
@@ -1017,10 +1128,13 @@ class Checker:
     async def check_one(self, p: Proxy, target: Optional[str] = None) -> tuple[bool, float, str]:
         target = target or self._next_target()
         async with self._sem:
+            # 体检也走出口自己的画像，不要让 M 条代理共用一把 UA 被聚成一堆
+            profile = self.pool.fingerprints.by_name(p.profile)
             t0 = time.monotonic()
             try:
                 status, headers, body = await fetch_via_proxy(
-                    p, target, timeout=self.timeout, max_bytes=self.max_bytes)
+                    p, target, timeout=self.timeout, max_bytes=self.max_bytes,
+                    profile=profile)
                 latency = (time.monotonic() - t0) * 1000
                 ok = 200 <= status < 400
                 reason = f"status={status}"
@@ -1031,6 +1145,12 @@ class Checker:
                 elif ok and status == 200 and not body:
                     ok = False
                     reason = "status=200 但响应体为空（疑似拦截页）"
+                elif ok and self.content_check:
+                    # L2 内容一致性：与直连基线比 sha256，防「能连但返回假页」
+                    same, why = await self.gate.content_ok(p, target)
+                    if not same:
+                        ok = False
+                        reason = f"status={status} 内容与直连基线不一致 ({why})"
                 self.pool.report(p, ok, latency)
                 if not ok:
                     log("debug", "check fail %s reason=%s", p.label, reason)
@@ -1041,6 +1161,29 @@ class Checker:
             except Exception as e:
                 self.pool.report(p, False, 0.0)
                 return False, 0.0, type(e).__name__
+
+    async def deep_check(self, p: Proxy) -> dict:
+        """五判据全量体检：透明性 / 注入 / 篡改 / 一致性 / 端口面。"""
+        async with self._sem:
+            record = await self.gate.audit(p, deep=True)
+        self.pool.apply_audit(p, record)
+        return record
+
+    async def deep_check_many(self, proxies: list[Proxy]) -> dict:
+        if not proxies:
+            return {"checked": 0, "usable": 0, "degraded": 0,
+                    "blacklist": 0, "unusable": 0}
+        results = await asyncio.gather(
+            *[self.deep_check(p) for p in proxies], return_exceptions=True)
+        tally = {"checked": len(proxies), "usable": 0, "degraded": 0,
+                 "blacklist": 0, "unusable": 0, "error": 0}
+        for record in results:
+            if isinstance(record, Exception):
+                tally["error"] += 1
+                continue
+            tally[record.get("grade", "unusable")] = \
+                tally.get(record.get("grade", "unusable"), 0) + 1
+        return tally
 
     async def check_many(self, proxies: list[Proxy]) -> dict:
         if not proxies:
@@ -1081,6 +1224,8 @@ class Gateway:
         self.direct_fallback = bool(g["direct_fallback"])
         self.connect_timeout = float(g["connect_timeout"])
         self.idle_timeout = float(g["idle_timeout"])
+        self.rhythm_on = bool(g.get("rhythm_enabled", True))
+        self.shape_headers = bool(g.get("shape_headers", True))
         self.pool = pool
         self.checker = checker
         self.stats = {"conn": 0, "ok": 0, "fail": 0, "retry": 0, "direct": 0}
@@ -1165,11 +1310,16 @@ class Gateway:
         last_err = "no proxy available"
         attempted_ids: set[int] = set()
         for i in range(attempts):
-            p = self.pool.pick(session_key=None, exclude_ids=attempted_ids)
+            # host 参与选路：单出口冷却防单 IP 高频；网关裸请求不绑亲和
+            # （绑了会把同域并发全压到一条线，A/B 轮换就失效了）
+            p = self.pool.pick(session_key=None, exclude_ids=attempted_ids,
+                               host=host, affinity=False)
             if p is None:
                 break
             attempted_ids.add(p.id)
             try:
+                if self.rhythm_on:
+                    await self.pool.rhythm.wait(host, p.key)
                 ur, uw, lat = await self._open_upstream(p, host, port)
             except Exception as e:
                 last_err = f"{p.label}: {type(e).__name__}"
@@ -1242,12 +1392,14 @@ class Gateway:
         attempted = False
         attempted_ids: set[int] = set()
         for i in range(attempts):
-            p = self.pool.pick(exclude_ids=attempted_ids)
+            p = self.pool.pick(exclude_ids=attempted_ids, host=u.hostname, affinity=False)
             if p is None:
                 break
             attempted_ids.add(p.id)
             try:
                 attempted = True
+                if self.rhythm_on:
+                    await self.pool.rhythm.wait(u.hostname, p.key)
                 status, resp, lat = await self._forward_once(p, u, parts[0], headers, body)
             except Exception as e:
                 self.pool.report(p, False)
@@ -1290,6 +1442,7 @@ class Gateway:
         port = u.port or (443 if u.scheme == "https" else 80)
         path = (u.path or "/") + (("?" + u.query) if u.query else "")
         t0 = time.monotonic()
+        profile = self.pool.fingerprints.by_name(p.profile)
 
         # 上游需要建隧道的情形：socks5 或目标是 https
         need_tunnel = p.scheme in ("socks5", "socks4") or u.scheme == "https"
@@ -1297,12 +1450,12 @@ class Gateway:
             r, w = await open_tunnel(p, host, port, self.connect_timeout)
             try:
                 if u.scheme == "https":
-                    ctx = verified_tls_context()
+                    ctx = tls_context(profile)
                     await asyncio.wait_for(w.start_tls(ctx, server_hostname=host),
                                            self.connect_timeout)
                 req_line = f"{method} {path} HTTP/1.1"
                 out = self._rebuild_headers(req_line, headers, u.netloc, body,
-                                            strip_proxy_auth=True)
+                                            strip_proxy_auth=True, profile=profile)
                 w.write(out)
                 await w.drain()
                 resp = await self._relay_response(r, w, method)
@@ -1320,7 +1473,7 @@ class Gateway:
         try:
             req_line = f"{method} {urllib.parse.urlunsplit(u)} HTTP/1.1"
             out = self._rebuild_headers(req_line, headers, u.netloc, body,
-                                        strip_proxy_auth=True)
+                                        strip_proxy_auth=True, profile=profile)
             if p.user:
                 out = out.replace(b"\r\n\r\n",
                                   f"\r\nProxy-Authorization: {basic_header(p.user, p.password)}"
@@ -1338,7 +1491,8 @@ class Gateway:
 
     def _rebuild_headers(self, req_line: str, headers: list[tuple[str, str]],
                          host_header: str, body: bytes,
-                         strip_proxy_auth: bool = True) -> bytes:
+                         strip_proxy_auth: bool = True,
+                         profile=None) -> bytes:
         # The body has been decoded; never forward its original framing.
         # Otherwise a de-chunked request can retain Transfer-Encoding: chunked
         # or a truncated Content-Length, making the next hop misparse it.
@@ -1350,23 +1504,35 @@ class Gateway:
                 skip.update(part.strip().lower() for part in value.split(","))
         if not strip_proxy_auth:
             skip.discard("proxy-authorization")
-        lines = [req_line]
-        seen_host = False
-        for k, v in headers:
-            low = k.lower()
-            if low in skip:
-                continue
-            if low == "host":
+
+        if profile is not None and self.shape_headers:
+            # 按出口画像重排头序并补默认头：同一出口永远同一画像，跨请求不漂移
+            kept = [(k, v) for k, v in headers if k.lower() not in skip]
+            shaped = shape_request(profile, kept, host_header)
+            # Connection 挪到最后：真实客户端把 Content-Length 排在 Connection 之前
+            shaped = [(k, v) for k, v in shaped if k.lower() != "connection"]
+            lines = [req_line] + [f"{k}: {v}" for k, v in shaped]
+        else:
+            lines = [req_line]
+            seen_host = False
+            for k, v in headers:
+                low = k.lower()
+                if low in skip:
+                    continue
+                if low == "host":
+                    lines.append(f"Host: {host_header}")
+                    seen_host = True
+                    continue
+                lines.append(f"{k}: {v}")
+            if not seen_host:
                 lines.append(f"Host: {host_header}")
-                seen_host = True
-                continue
-            lines.append(f"{k}: {v}")
-        if not seen_host:
-            lines.append(f"Host: {host_header}")
+            lines.append("Connection: close")
+
         method = req_line.split(" ", 1)[0].upper()
         framed = any(k.lower() in ("content-length", "transfer-encoding")
                      for k, _ in headers)
-        if body or framed or method in ("POST", "PUT", "PATCH"):
+        if body or framed or method in ("POST", "PUT", "PATCH", "DELETE"):
+            # Content-Length 追加在最后：真实客户端也常在末尾带它
             lines.append(f"Content-Length: {len(body)}")
         lines.append("Connection: close")
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
@@ -1524,7 +1690,9 @@ class ApiServer:
                     raise ValueError("invalid exclusion list")
             except ValueError:
                 return json_response({"error": "invalid_exclude_ids"}, 400)
-            p = pool.pick(strategy=strategy, session_key=session, exclude_ids=excluded)
+            p = pool.pick(strategy=strategy, session_key=session, exclude_ids=excluded,
+                          host=(query.get("host", [None])[0] or None),
+                          affinity=(query.get("affinity", ["1"])[0] not in ("0", "false")))
             if p is None:
                 return json_response({"error": "no_proxy_available"}, 503)
             if (p.user or p.password) and not self.token:
@@ -1612,7 +1780,17 @@ class ApiServer:
                 f"proxy_gateway_conn_total {gw.get('conn', 0)}",
                 "# TYPE proxy_gateway_retry_total counter",
                 f"proxy_gateway_retry_total {gw.get('retry', 0)}",
+                "# TYPE proxy_pool_blacklist gauge",
+                f"proxy_pool_blacklist {s.get('blacklist', 0)}",
+                "# TYPE proxy_pool_grade gauge",
             ]
+            for grade, count in sorted(s.get("by_grade", {}).items()):
+                lines.append(f'proxy_pool_grade{{grade="{grade}"}} {count}')
+            lines.append("# TYPE proxy_pool_fingerprint_bucket gauge")
+            for name, count in sorted(s.get("fingerprints", {}).items()):
+                lines.append(f'proxy_pool_fingerprint_bucket{{profile="{name}"}} {count}')
+            lines.append("# TYPE proxy_pool_affinity_pairs gauge")
+            lines.append(f"proxy_pool_affinity_pairs {s.get('affinity', {}).get('affinity', 0)}")
             body = ("\n".join(lines) + "\n").encode()
             return http_response(200, "OK", [("Content-Type", "text/plain; charset=utf-8"),
                                              ("Connection", "close")], body)
@@ -1624,6 +1802,31 @@ class ApiServer:
                 return json_response({"error": "not found"}, 404)
             pool.report(p, bool(payload.get("ok")), float(payload.get("latency_ms", 0)))
             return json_response({"ok": True, "state": p.state, "score": round(p.score, 4)})
+
+        if path == "/rhythm" and method == "POST":
+            # 运行时调节律：宿主按目标站点容忍度改均值/速率，不用重启
+            try:
+                if "mu" in payload:
+                    pool.rhythm.mu = max(0.0, float(payload["mu"]))
+                if "sigma" in payload:
+                    pool.rhythm.sigma = max(0.0, float(payload["sigma"]))
+                if "per_key_qps" in payload:
+                    pool.rhythm.per_key_qps = max(0.01, float(payload["per_key_qps"]))
+                if "global_qps" in payload:
+                    pool.rhythm.global_qps = max(0.01, float(payload["global_qps"]))
+                    pool.rhythm._global.rate = pool.rhythm.global_qps
+                if "affinity_ttl" in payload:
+                    pool.affinity.affinity_ttl = max(0.0, float(payload["affinity_ttl"]))
+                if "proxy_cooldown" in payload:
+                    pool.affinity.cooldown = max(0.0, float(payload["proxy_cooldown"]))
+            except (TypeError, ValueError):
+                return json_response({"error": "invalid_value"}, 400)
+            return json_response({"ok": True, "mu": pool.rhythm.mu,
+                                  "sigma": pool.rhythm.sigma,
+                                  "per_key_qps": pool.rhythm.per_key_qps,
+                                  "global_qps": pool.rhythm.global_qps,
+                                  "affinity_ttl": pool.affinity.affinity_ttl,
+                                  "proxy_cooldown": pool.affinity.cooldown})
 
         if path == "/add" and method == "POST":
             raw = payload.get("proxies") or []
@@ -1679,13 +1882,61 @@ class ApiServer:
 
         if path == "/check" and method == "POST":
             scope = payload.get("scope", "all")
+            deep = bool(payload.get("deep", False))
             if scope == "all":
-                res = await self.app.checker.check_all()
+                targets = [p for p in pool.proxies
+                           if p.enabled and p.key not in pool.blacklist]
+                res = await self.app.checker.check_many(targets)
+                if deep:
+                    res["deep"] = await self.app.checker.deep_check_many(targets)
             else:
                 ids = [int(x) for x in (payload.get("ids") or [])]
                 targets = [pool.by_id[i] for i in ids if i in pool.by_id]
                 res = await self.app.checker.check_many(targets)
+                if deep:
+                    res["deep"] = await self.app.checker.deep_check_many(targets)
             return json_response(res)
+
+        if path == "/audit" and method == "POST":
+            # 五判据全量体检。ids 缺省对全体非黑名单代理跑一遍。
+            ids = [int(x) for x in (payload.get("ids") or [])]
+            if ids:
+                targets = [pool.by_id[i] for i in ids if i in pool.by_id]
+            else:
+                targets = [p for p in pool.proxies
+                           if p.enabled and p.key not in pool.blacklist]
+            res = await self.app.checker.deep_check_many(targets)
+            return json_response(res)
+
+        if path == "/audit/detail":
+            pid = int(query.get("id", ["0"])[0] or 0)
+            p = pool.by_id.get(pid)
+            if not p:
+                return json_response({"error": "not found"}, 404)
+            return json_response({"id": p.id, "grade": p.grade,
+                                  "profile": p.profile, "audit": p.audit})
+
+        if path == "/blacklist":
+            if method == "DELETE":
+                keys = payload.get("keys")
+                freed = pool.clear_blacklist(keys if isinstance(keys, list) else None)
+                return json_response({"freed": freed, "remaining": len(pool.blacklist)})
+            return json_response({"keys": sorted(pool.blacklist),
+                                  "count": len(pool.blacklist)})
+
+        if path == "/hardening":
+            return json_response({
+                "rhythm": {"mu": pool.rhythm.mu, "sigma": pool.rhythm.sigma,
+                           "per_key_qps": pool.rhythm.per_key_qps,
+                           "global_qps": pool.rhythm.global_qps},
+                "affinity": pool.affinity.stats(),
+                "fingerprints": {pr.name: sum(1 for p in pool.proxies if p.profile == pr.name)
+                                 for pr in pool.fingerprints.profiles},
+                "gateway": {"rhythm_enabled": bool(self.app.gateway and
+                                                   self.app.gateway.rhythm_on),
+                            "shape_headers": bool(self.app.gateway and
+                                                  self.app.gateway.shape_headers)},
+            })
 
         if path in ("/reload", "/flush") and method == "POST":
             self.app.store.save_states(pool.proxies)
@@ -1713,7 +1964,8 @@ class ApiServer:
             return http_response(200, "OK", [("Content-Type", "text/plain"),
                                              ("Connection", "close")], body)
         if fmt == "scrapy":
-            body = json.dumps({proxy_url(p, with_auth=False): DEFAULT_UA}).encode()
+            profile = pool.fingerprints.by_name(p.profile)
+            body = json.dumps({proxy_url(p, with_auth=False): shape_ua(profile)}).encode()
             return http_response(200, "OK", [("Content-Type", "application/json"),
                                              ("Connection", "close")], body)
         return json_response(p.to_dict(with_auth=True))
@@ -1984,7 +2236,8 @@ async def selftest() -> int:
         "api": {"port": 19011, "token": ""},
         "gateway": {"port": 19010, "enabled": True, "max_retry": 1},
         "checker": {"interval": 0, "startup_sweep": False, "timeout": 5.0,
-                    "targets": ["http://127.0.0.1:19001/echo"], "expect_contains": ""},
+                    "targets": ["http://127.0.0.1:19001/echo"], "expect_contains": "",
+                    "content_check": False},
         "storage": {"db": _dbpath},
     })
     app = App(cfg)
